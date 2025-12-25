@@ -3,6 +3,12 @@
 # Jump to the directory that owns this script
 cd "${0%/*}" || exit 1
 
+# Protection from cron job
+if [ -f working ] ; then
+    echo "Under construction..."
+    exit 67
+fi
+
 # Do we have keys to sign with?
 if [ ! -f id_rsa ] ; then
     rm -rf id_rsa id_rsa.pub
@@ -11,6 +17,7 @@ fi
 
 # Remove old state
 rm -f changed
+touch changed
 
 # Create the void-packages directory if it doesn't exit
 mkdir -p void-packages
@@ -25,23 +32,27 @@ if [ ! -d srcpkgs ] ; then
     cp ../packages.list ../changed
 else
     # Yes, pull in the changes for this run
-    git reset --hard HEAD
-    git pull | tee ../changed
+    if [ ! -z "$(git status --porcelain)" ] ; then
+        echo "Tree not clean..."
+        exit 68
+    fi
+    old_head="$(git rev-parse HEAD)"
+    if ! git fetch upstream master:master ; then
+        echo "Can't fetch upstream..."
+        exit 69
+    fi
+    # assuming no conflicts, since my commits should only introduce new pkgs
+    if git merge -m "Merge upstream" master ; then
+        git diff --name-status ${old_head} HEAD | cut -d/ -f1,2 | tee ../changed
+    else
+        echo "Merge failed..."
+        exit 70
+    fi
 fi
 
-# Does this system use another set of repos
-if [ -d /etc/xbps.d ] ; then
-    cat /etc/xbps.d/* > etc/repos-remote.conf
-    # If this platform is 64 bit, override those as well
-    if [ "$(xbps-uhelper arch)" = "x86_64" ] ; then
-        cat /etc/xbps.d/* > etc/repos-remote-x86_64.conf
-    fi
-
-    # The bootstrap config is loaded seperately
-    if [ -f /etc/xbps.d/00-repository-main.conf ] ; then
-        repo="$(sed 's/^.*=//' < /etc/xbps.d/00-repository-main.conf)"
-        printf 'XBPS_INSTALL_ARGS="--repository=%s --repository=%s/musl"\n' "${repo}" "${repo}" > etc/conf
-    fi
+# Apply provided config file if it exists
+if [ -f ../xbps-src.conf ] && [ ! -f etc/conf ]; then
+    ln -s ../../xbps-src.conf etc/conf
 fi
 
 # Do we have a live build environment
@@ -53,11 +64,6 @@ else
     ./xbps-src bootstrap-update
 fi
 
-# Apply provided config file if it exists
-if [ -f ../xbps-src.conf ] ; then
-    cat ../xbps-src.conf >> etc/conf
-fi
-
 if [ -z "$@" ] ; then
     while read -r package ; do
         if grep "${package}" ../changed; then
@@ -65,21 +71,29 @@ if [ -z "$@" ] ; then
         fi
     done < ../packages.list
 else
-	for pkg in "$@"; do
-		./xbps-src pkg "${pkg}"
-	done
+    for pkg in "$@"; do
+        ./xbps-src pkg "${pkg}"
+    done
 fi
 
 # Sign built packages
-xbps-rindex --sign --signedby "XBPS-mini-builder" --privkey ../id_rsa hostdir/binpkgs
-xbps-rindex --sign-pkg --privkey ../id_rsa hostdir/binpkgs/*.xbps
+branch="$(git rev-parse --abbrev-ref HEAD)"
+if [ "${branch}" = "master" ] ; then
+    branch=""
+else
+    branch="/${branch}"
+fi
+
+printf "Updating repodata in hostdir/binpkgs${branch}\\n"
+xbps-rindex --sign --signedby "XBPS-mini-builder" --privkey ../id_rsa "hostdir/binpkgs${branch}"
+printf "Signing packages in hostdir/binpkgs${branch}\\n"
+xbps-rindex --sign-pkg --privkey ../id_rsa hostdir/binpkgs${branch}/*.xbps
 
 for folder in multilib multilib/nonfree nonfree ; do
-    printf "Trying to sign packages in %s\\n" ${folder}
-    if [ -d "hostdir/binpkgs/${folder}" ] ; then
-        printf "Updating repodata in hostdir/binpkgs/%s\\n" ${folder}
-        xbps-rindex --sign --signedby "XBPS-mini-builder" --privkey ../id_rsa "hostdir/binpkgs/${folder}/"
-        printf "Signing packages in hostdir/binpkgs/%s\\n" ${folder}
-        xbps-rindex --sign-pkg --privkey ../id_rsa hostdir/binpkgs/${folder}/*.xbps
+    if [ -d "hostdir/binpkgs${branch}/${folder}" ] ; then
+        printf "Updating repodata in hostdir/binpkgs${branch}/%s\\n" ${folder}
+        xbps-rindex --sign --signedby "XBPS-mini-builder" --privkey ../id_rsa hostdir/binpkgs${branch}/${folder}/
+        printf "Signing packages in hostdir/binpkgs${branch}/%s\\n" ${folder}
+        xbps-rindex --sign-pkg --privkey ../id_rsa hostdir/binpkgs${branch}/${folder}/*.xbps
     fi
 done
